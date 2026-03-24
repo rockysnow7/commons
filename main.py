@@ -177,9 +177,32 @@ def get_repost_chain(leaf_post: DisplayPost) -> RepostChain:
 
     return RepostChain(posts=chain)
 
+def get_repost_chain_from_post_id(post_id: ObjectId) -> RepostChain:
+    """Returns the ordered repost chain ending at the post with the given ID."""
+
+    post = posts_collection.find_one({"_id": post_id})
+    if post is None:
+        raise HTTPException(status_code=404, detail={"message": "Post not found."})
+    author = users_collection.find_one({"_id": post["author_id"]})
+    post["author_username"] = author["username"]
+
+    tree_ids = get_repost_tree_ids(post_id)
+    tree_likes = next(posts_collection.aggregate([
+        {"$match": {"_id": {"$in": tree_ids}}},
+        {"$group": {
+            "_id": None,
+            "total_likes": {"$sum": {"$size": "$liked_by"}},
+        }},
+    ]), None)
+    post["num_display_likes"] = tree_likes["total_likes"] if tree_likes is not None else 0
+
+    return get_repost_chain(DisplayPost.model_validate(post))
+
 
 @app.post("/users/register", status_code=201)
 def register(request: RegisterRequest) -> dict:
+    """Registers a new user, if the username is not already taken."""
+
     password_hash = argon2.hash(request.password)
     user = {
         "username": request.username,
@@ -195,6 +218,8 @@ def register(request: RegisterRequest) -> dict:
 
 @app.post("/users/login", status_code=200)
 def login(request: LoginRequest) -> dict:
+    """Logs in a user, if the username and password are correct."""
+
     user = users_collection.find_one({"username": request.username})
     if user is None:
         raise HTTPException(status_code=401, detail={"message": "Invalid username or password."})
@@ -210,6 +235,8 @@ def follow_user(
     user_to_follow_id: PyObjectId,
     user_id: ObjectId = Depends(get_current_user_id),
 ) -> dict:
+    """Follows the given user."""
+
     if user_to_follow_id == user_id:
         raise HTTPException(status_code=400, detail={"message": "You cannot follow yourself."})
 
@@ -226,6 +253,8 @@ def unfollow_user(
     user_to_unfollow_id: PyObjectId,
     user_id: ObjectId = Depends(get_current_user_id),
 ) -> dict:
+    """Unfollows the given user."""
+
     result = users_collection.update_one(
         {"_id": user_id, "following": user_to_unfollow_id},
         {"$pull": {"following": user_to_unfollow_id}},
@@ -239,6 +268,8 @@ def publish_post(
     request: PublishPostRequest,
     user_id: ObjectId = Depends(get_current_user_id),
 ) -> dict:
+    """Publishes a new post."""
+
     post = {
         "title": request.title,
         "content": request.content,
@@ -255,12 +286,13 @@ def like_post(
     post_id: PyObjectId,
     user_id: ObjectId = Depends(get_current_user_id),
 ) -> dict:
-    result = posts_collection.update_one(
-        {"_id": post_id, "liked_by": {"$ne": user_id}},
+    """Likes the given post and any posts above it in the repost chain."""
+
+    repost_chain_ids = [p.id for p in get_repost_chain_from_post_id(post_id).posts]
+    posts_collection.update_many(
+        {"_id": {"$in": repost_chain_ids}, "liked_by": {"$ne": user_id}},
         {"$addToSet": {"liked_by": user_id}},
     )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=400, detail={"message": "Post not found or already liked."})
     return {"message": "Post liked."}
 
 @app.post("/posts/{post_id}/unlike", status_code=200)
@@ -268,16 +300,19 @@ def unlike_post(
     post_id: PyObjectId,
     user_id: ObjectId = Depends(get_current_user_id),
 ) -> dict:
-    result = posts_collection.update_one(
-        {"_id": post_id, "liked_by": user_id},
+    """Unlikes the given post and any posts above it in the repost chain."""
+
+    repost_chain_ids = [p.id for p in get_repost_chain_from_post_id(post_id).posts]
+    posts_collection.update_many(
+        {"_id": {"$in": repost_chain_ids}, "liked_by": user_id},
         {"$pull": {"liked_by": user_id}},
     )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=400, detail={"message": "Post not found or not liked."})
     return {"message": "Post unliked."}
 
 @app.get("/feed/private", status_code=200)
 def get_private_feed(user_id: ObjectId = Depends(get_current_user_id)) -> FeedResponse:
+    """Returns the private feed for the current user."""
+
     user = users_collection.find_one({"_id": user_id})
     if user is None:
         raise HTTPException(status_code=404, detail={"message": "User not found."})
